@@ -302,6 +302,76 @@ func TestHappyPathAndMetrics(t *testing.T) {
 	}
 }
 
+// TestLastPageIsLastPageReachedNotMax is a regression test. lastPage must be
+// the page of the most recent PAGE_REACHED event, NOT the maximum page across
+// all events. A reader may reach p100, react to a passage on p150, then page
+// back to p40 to re-read — lastPage must be 40. PASSAGE_REACTED.page must not
+// influence it either.
+func TestLastPageIsLastPageReachedNotMax(t *testing.T) {
+	env := newEnv(t)
+	book := env.createBook("Paging Back")
+	sess := env.createSession(book.ID)
+	base := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+
+	steps := []struct {
+		event  string
+		minute int
+		page   *int
+		note   string
+		quote  string
+		seqIn  int
+	}{
+		{"SESSION_STARTED", 0, nil, "", "", 0},
+		{"PAGE_REACHED", 1, intPtr(100), "", "", 1},
+		// A reaction on a later (higher) page must not move lastPage.
+		{"PASSAGE_REACTED", 2, intPtr(150), "Foreshadowing on the next chapter.", "…", 2},
+		// Reader pages back to re-read. This is the last PAGE_REACHED.
+		{"PAGE_REACHED", 3, intPtr(40), "", "", 3},
+		// Another reaction on an even higher page must still not move lastPage.
+		{"PASSAGE_REACTED", 4, intPtr(200), "Circling back to a motif.", "…", 4},
+	}
+
+	for _, stp := range steps {
+		body := map[string]any{
+			"eventType":   stp.event,
+			"occurredAt":  base.Add(time.Duration(stp.minute) * time.Minute).Format(time.RFC3339Nano),
+			"expectedSeq": stp.seqIn,
+		}
+		if stp.page != nil {
+			body["page"] = *stp.page
+		}
+		if stp.note != "" {
+			body["note"] = stp.note
+		}
+		if stp.quote != "" {
+			body["quote"] = stp.quote
+		}
+		st, _, eb := env.appendEvent(sess.ID, body, "")
+		if st != 201 {
+			t.Fatalf("append %s failed: %d %+v", stp.event, st, eb)
+		}
+	}
+
+	status, body := env.do(http.MethodGet, "/sessions/"+sess.ID, nil, "")
+	if status != 200 {
+		t.Fatalf("GET session status=%d body=%s", status, body)
+	}
+	detail := decode[domain.SessionDetail](t, body)
+
+	if detail.LastPage == nil {
+		t.Fatalf("expected lastPage to be set")
+	}
+	if *detail.LastPage != 40 {
+		t.Fatalf("expected lastPage=40 (last PAGE_REACHED, reader paged back), got %d; lastPage must not be the max page nor influenced by PASSAGE_REACTED", *detail.LastPage)
+	}
+	// Sanity: passages carry their own pages (150 and 200), independently.
+	if len(detail.Passages) != 2 {
+		t.Fatalf("expected 2 passages, got %d", len(detail.Passages))
+	}
+}
+
+func intPtr(v int) *int { return &v }
+
 func TestIllegalStateTransitions(t *testing.T) {
 	env := newEnv(t)
 	book := env.createBook("Illegal States")

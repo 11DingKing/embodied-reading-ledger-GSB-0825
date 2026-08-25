@@ -72,9 +72,11 @@ func (s *Service) GetSession(ctx context.Context, id string) (*domain.SessionDet
 				Quote:      e.Quote,
 				OccurredAt: e.OccurredAt,
 			})
-		}
-		if e.Page != nil {
-			if lastPage == nil || *e.Page > *lastPage {
+		case domain.EventPageReached:
+			// lastPage is the page of the most recent PAGE_REACHED event,
+			// not the maximum — readers may page back to re-read. PASSAGE_REACTED
+			// deliberately does not update it.
+			if e.Page != nil {
 				v := *e.Page
 				lastPage = &v
 			}
