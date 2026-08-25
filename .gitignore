@@ -1,0 +1,22 @@
+# Go build and test artifacts
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+
+# Local configuration and generated data
+.env
+.env.*
+!.env.example
+*.log
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+
