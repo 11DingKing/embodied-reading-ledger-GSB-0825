@@ -1,0 +1,308 @@
+openapi: 3.0.3
+info:
+  title: Embodied Reading Ledger
+  version: 1.0.0
+  description: >-
+    An append-only ledger for embodied (paper-book) reading. Readers register
+    physical editions, open sessions, and append events
+    (SESSION_STARTED, PAGE_REACHED, PASSAGE_REACTED, INTERRUPTED,
+    SESSION_ENDED). The server reconstructs reading minutes, last page,
+    interruption count and the reader's own reactions. All correctness
+    (concurrency, idempotency, append-only) is enforced in PostgreSQL.
+servers:
+  - url: http://localhost:8080
+tags:
+  - name: books
+  - name: sessions
+  - name: events
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        Required on every write request. A replayed key with the identical
+        body returns the first response verbatim and never writes twice; the
+        same key with a different body returns 422 E_IDEMPOTENCY_MISMATCH.
+      schema:
+        type: string
+    SessionId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    Book:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        author: { type: string }
+        edition: { type: string }
+        isbn: { type: string }
+        total_pages: { type: integer, minimum: 1 }
+        created_at:
+          { type: string, format: date-time, description: UTC RFC3339Nano }
+    Session:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        book_id: { type: string, format: uuid }
+        reader_name: { type: string }
+        state: { type: string, enum: [OPEN, ENDED] }
+        last_seq: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+        ended_at: { type: string, format: date-time }
+    Event:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        session_id: { type: string, format: uuid }
+        seq: { type: integer, format: int64 }
+        type:
+          type: string
+          enum:
+            [
+              SESSION_STARTED,
+              PAGE_REACHED,
+              PASSAGE_REACTED,
+              INTERRUPTED,
+              SESSION_ENDED,
+            ]
+        occurred_at:
+          type: string
+          format: date-time
+          description: Client-reported, validated, stored as UTC RFC3339Nano.
+        recorded_at:
+          type: string
+          format: date-time
+          description: Server receive time, UTC.
+        page: { type: integer }
+        passage: { type: string }
+        reaction: { type: string, description: The reader's own written note. }
+        interrupt_reason: { type: string }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - E_VALIDATION
+                - E_NOT_FOUND
+                - E_IDEMPOTENCY_REQUIRED
+                - E_IDEMPOTENCY_MISMATCH
+                - E_IDEMPOTENCY_IN_PROGRESS
+                - E_SEQ_CONFLICT
+                - E_TIME_REGRESSION
+                - E_PAGE_BEFORE_START
+                - E_APPEND_AFTER_END
+                - E_INVALID_STATE_TRANSITION
+                - E_CONFLICT
+                - E_INTERNAL
+            message: { type: string }
+            details:
+              type: object
+              additionalProperties: true
+  responses:
+    Error:
+      description: Structured error body.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+paths:
+  /books:
+    post:
+      tags: [books]
+      summary: Register a physical edition
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, author, edition, isbn, total_pages]
+              properties:
+                title: { type: string }
+                author: { type: string }
+                edition: { type: string }
+                isbn: { type: string }
+                total_pages: { type: integer, minimum: 1 }
+      responses:
+        "201":
+          description: Book registered.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  book:
+                    $ref: "#/components/schemas/Book"
+        "400": { $ref: "#/components/responses/Error" }
+        "409":
+          description: ISBN already registered (E_CONFLICT).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422": { $ref: "#/components/responses/Error" }
+  /sessions:
+    post:
+      tags: [sessions]
+      summary: Open a reading session
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [book_id, reader_name]
+              properties:
+                book_id: { type: string, format: uuid }
+                reader_name: { type: string }
+      responses:
+        "201":
+          description: Session opened.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session:
+                    $ref: "#/components/schemas/Session"
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /sessions/{id}/events:
+    post:
+      tags: [events]
+      summary: Append one event to the session log
+      description: >-
+        Requires expected_seq (optimistic concurrency). Among concurrent
+        writers to the same session exactly one wins; losers receive 409
+        E_SEQ_CONFLICT with the current sequence. Illegal transitions return
+        stable codes: E_PAGE_BEFORE_START (page reached before
+        SESSION_STARTED), E_TIME_REGRESSION (client clock moved backwards),
+        E_APPEND_AFTER_END (append after SESSION_ENDED),
+        E_INVALID_STATE_TRANSITION.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, occurred_at, expected_seq]
+              properties:
+                type:
+                  type: string
+                  enum:
+                    [
+                      SESSION_STARTED,
+                      PAGE_REACHED,
+                      PASSAGE_REACTED,
+                      INTERRUPTED,
+                      SESSION_ENDED,
+                    ]
+                occurred_at:
+                  type: string
+                  format: date-time
+                  description: RFC3339Nano; must not precede the previous event.
+                expected_seq:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                page: { type: integer, description: Required for PAGE_REACHED. }
+                passage: { type: string }
+                reaction:
+                  { type: string, description: Required for PASSAGE_REACTED. }
+                interrupt_reason: { type: string }
+      responses:
+        "201":
+          description: Event appended.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  event:
+                    $ref: "#/components/schemas/Event"
+                  session:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      state: { type: string, enum: [OPEN, ENDED] }
+                      last_seq: { type: integer, format: int64 }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409":
+          description: E_SEQ_CONFLICT or E_APPEND_AFTER_END.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: E_TIME_REGRESSION, E_PAGE_BEFORE_START, E_INVALID_STATE_TRANSITION or E_IDEMPOTENCY_MISMATCH.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /sessions/{id}:
+    get:
+      tags: [sessions]
+      summary: Reconstruct a session from its event log
+      description: >-
+        Durations are computed server-side from adjacent events
+        (occurred_at deltas); reading_minutes is their sum. Also returns the
+        last reached page, interruption count and reader-written reactions.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Reconstructed session.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session:
+                    $ref: "#/components/schemas/Session"
+                  book:
+                    $ref: "#/components/schemas/Book"
+                  events:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: "#/components/schemas/Event"
+                        - type: object
+                          properties:
+                            duration_since_previous_seconds:
+                              type: number
+                              description: Server-computed delta vs the previous event (0 for the first).
+                  reading_seconds: { type: number }
+                  reading_minutes: { type: number }
+                  last_page: { type: integer, nullable: true }
+                  interruption_count: { type: integer }
+                  reactions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        seq: { type: integer, format: int64 }
+                        occurred_at: { type: string, format: date-time }
+                        page: { type: integer }
+                        passage: { type: string }
+                        reaction: { type: string }
+        "404": { $ref: "#/components/responses/Error" }
