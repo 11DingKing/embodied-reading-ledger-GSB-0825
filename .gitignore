@@ -1,0 +1,9 @@
+bin/
+*.test
+coverage.out
+.env
+*.db
+*.sqlite
+.idea/
+.vscode/
+

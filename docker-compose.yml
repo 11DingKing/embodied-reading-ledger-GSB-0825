@@ -1,0 +1,22 @@
+services:
+  db:
+    image: postgres:16
+    container_name: erl_db
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    # Host port 5439 avoids clashing with other local Postgres instances.
+    # The DATABASE_URL default in the app matches this mapping.
+    ports:
+      - "5439:5432"
+    volumes:
+      - erl_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  erl_pgdata:
