@@ -111,18 +111,22 @@ func TestIdempotencyKeyReuseWithDifferentBody(t *testing.T) {
 }
 
 // TestConcurrentAppendRace fires N simultaneous appends all claiming seq 1.
-// Exactly one must win (201); every loser must receive 409 SEQ_CONFLICT with the
-// authoritative currentSeq. Correctness is enforced solely by the Postgres
-// unique constraint — no in-process lock.
+// Exactly one must win (201); every loser must receive 409 SEQ_CONFLICT carrying
+// the authoritative currentSeq (1, the seq the winner just took). Correctness is
+// enforced solely by the Postgres unique constraint — no in-process lock — and
+// the losing branch must recover its transaction (savepoint rollback) so the
+// currentSeq query returns the real value rather than a bogus 0.
 func TestConcurrentAppendRace(t *testing.T) {
 	env := newTestEnv(t)
 	_, sessionID := env.createBookAndSession(t)
 
 	const n = 12
 	var (
-		wg        sync.WaitGroup
-		successes atomic.Int64
-		conflicts atomic.Int64
+		wg           sync.WaitGroup
+		successes    atomic.Int64
+		conflicts    atomic.Int64
+		mu           sync.Mutex
+		conflictSeqs []int
 	)
 	start := make(chan struct{})
 	for i := 0; i < n; i++ {
@@ -137,7 +141,15 @@ func TestConcurrentAppendRace(t *testing.T) {
 				successes.Add(1)
 			case http.StatusConflict:
 				conflicts.Add(1)
-				assertErrorCode(t, body, "SEQ_CONFLICT")
+				details := assertErrorCode(t, body, "SEQ_CONFLICT")
+				cs, ok := details["currentSeq"].(float64)
+				if !ok {
+					t.Errorf("conflict body missing numeric currentSeq: %s", body)
+					return
+				}
+				mu.Lock()
+				conflictSeqs = append(conflictSeqs, int(cs))
+				mu.Unlock()
 			default:
 				t.Errorf("unexpected status %d body %s", status, body)
 			}
@@ -151,6 +163,18 @@ func TestConcurrentAppendRace(t *testing.T) {
 	}
 	if conflicts.Load() != n-1 {
 		t.Fatalf("conflicts = %d, want %d", conflicts.Load(), n-1)
+	}
+
+	// Every loser must report the true current sequence (1), never 0. Before the
+	// savepoint fix, the conflict query ran inside an aborted transaction and this
+	// would surface currentSeq: 0.
+	if len(conflictSeqs) != n-1 {
+		t.Fatalf("collected %d conflict currentSeq values, want %d", len(conflictSeqs), n-1)
+	}
+	for _, cs := range conflictSeqs {
+		if cs != 1 {
+			t.Fatalf("conflict currentSeq = %d, want 1 (details = %v)", cs, conflictSeqs)
+		}
 	}
 
 	// Ledger must hold exactly one event at seq 1.

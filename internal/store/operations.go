@@ -247,16 +247,33 @@ func (s *Store) AppendEventTx(ctx context.Context, tx pgx.Tx, in AppendEventInpu
 		return AppendEventResult{}, fmt.Errorf("marshal payload: %w", err)
 	}
 
-	_, err = tx.Exec(ctx, `
+	// Wrap the INSERT in a SAVEPOINT (pgx nested transaction). A unique-key
+	// collision aborts only the savepoint, not the whole transaction, so after
+	// rolling back to it we can still run the follow-up query that reports the
+	// authoritative current sequence. Without this, the conflicting query would
+	// run inside an aborted transaction and fail, yielding a bogus currentSeq: 0.
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return AppendEventResult{}, fmt.Errorf("open savepoint: %w", err)
+	}
+	_, err = sp.Exec(ctx, `
 		INSERT INTO events (session_id, seq, type, occurred_at, recorded_at, payload)
 		VALUES ($1, $2, $3, $4, $5, $6)
 	`, in.SessionID, wantSeq, string(in.Type),
 		clock.Format(in.OccurredAt), clock.Format(recordedAt), payloadJSON)
 	if err != nil {
+		// Roll back to the savepoint so the outer transaction stays usable.
+		if rbErr := sp.Rollback(ctx); rbErr != nil {
+			return AppendEventResult{}, fmt.Errorf("rollback savepoint: %w", rbErr)
+		}
 		if isUniqueViolation(err) {
-			// A concurrent writer claimed this seq first. Report the authoritative
-			// current sequence so the client can retry from the right place.
-			currentSeq := s.currentSeq(ctx, tx, in.SessionID)
+			// A concurrent writer claimed this seq first. Query the authoritative
+			// current sequence on the now-recovered transaction so the client can
+			// retry from the right place.
+			currentSeq, seqErr := s.currentSeq(ctx, tx, in.SessionID)
+			if seqErr != nil {
+				return AppendEventResult{}, fmt.Errorf("read current seq after conflict: %w", seqErr)
+			}
 			return AppendEventResult{}, apperr.New(apperr.CodeSeqConflict,
 				"another writer already appended at this sequence").
 				WithDetails(map[string]any{
@@ -265,6 +282,10 @@ func (s *Store) AppendEventTx(ctx context.Context, tx pgx.Tx, in AppendEventInpu
 				})
 		}
 		return AppendEventResult{}, fmt.Errorf("insert event: %w", err)
+	}
+	// Release the savepoint, folding the successful INSERT into the outer tx.
+	if err := sp.Commit(ctx); err != nil {
+		return AppendEventResult{}, fmt.Errorf("release savepoint: %w", err)
 	}
 
 	// Keep the session status projection cache in step (append-only-safe: this
@@ -292,17 +313,18 @@ func (s *Store) AppendEventTx(ctx context.Context, tx pgx.Tx, in AppendEventInpu
 	}, nil
 }
 
-// currentSeq returns the max seq for a session, or 0 if none. Best-effort: on
-// error it returns 0 so callers can still surface a conflict.
-func (s *Store) currentSeq(ctx context.Context, tx pgx.Tx, sessionID string) int {
+// currentSeq returns the authoritative max seq for a session, or 0 if it has no
+// events yet. It must be called on a live (non-aborted) transaction; the caller
+// rolls back to a savepoint before invoking it after a conflicting INSERT.
+func (s *Store) currentSeq(ctx context.Context, tx pgx.Tx, sessionID string) (int, error) {
 	var maxSeq *int
 	if err := tx.QueryRow(ctx, `SELECT MAX(seq) FROM events WHERE session_id = $1`, sessionID).Scan(&maxSeq); err != nil {
-		return 0
+		return 0, fmt.Errorf("query current seq: %w", err)
 	}
 	if maxSeq == nil {
-		return 0
+		return 0, nil
 	}
-	return *maxSeq
+	return *maxSeq, nil
 }
 
 // SessionView is the read model returned by GET /sessions/{id}.
