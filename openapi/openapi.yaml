@@ -1,0 +1,327 @@
+openapi: 3.0.3
+info:
+  title: Embodied Reading Event Ledger API
+  description: >
+    A backend that faithfully records the real process of reading a physical
+    book. Readers register a book edition, open a session, and append an ordered
+    stream of events (SESSION_STARTED, PAGE_REACHED, PASSAGE_REACTED,
+    INTERRUPTED, SESSION_ENDED). The server reconstructs reading minutes, the
+    last page reached, interruption count, and the reader's own notes.
+
+    All timestamps are stored and returned in UTC RFC3339Nano. Durations are
+    computed server-side from adjacent events. The event ledger is append-only.
+  version: "1.0.0"
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+tags:
+  - name: Books
+  - name: Sessions
+  - name: Events
+
+paths:
+  /books:
+    post:
+      tags: [Books]
+      summary: Register a physical book edition
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBookRequest"
+      responses:
+        "201":
+          description: Book created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Book"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /sessions:
+    post:
+      tags: [Sessions]
+      summary: Create a reading session for a book
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionRequest"
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/BookNotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /sessions/{id}:
+    get:
+      tags: [Sessions]
+      summary: Retrieve a session with computed reading metrics
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Session detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionDetail"
+        "404": { $ref: "#/components/responses/SessionNotFound" }
+
+  /sessions/{id}/events:
+    post:
+      tags: [Events]
+      summary: Append an event to a session
+      description: >
+        Appends a single event. The request must carry `expectedSeq` equal to
+        the current maximum sequence of the session (0 before the first event).
+        Concurrent appends are serialized by a row lock; only one writer at a
+        given `expectedSeq` succeeds and the others receive 409 with the current
+        sequence. The first event must be SESSION_STARTED; after SESSION_ENDED
+        no further events may be appended.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AppendEventRequest"
+      responses:
+        "201":
+          description: Event appended
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Event"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/SessionNotFound" }
+        "409":
+          description: >
+            Sequence conflict (expectedSeq mismatch) or other state conflict.
+            The body includes `currentSeq`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /healthz:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >
+        Client-generated key that makes a write safely retryable. Repeating a
+        request with the same key and body returns the first response without
+        performing a second write. Reusing a key with a different body returns
+        422 IDEMPOTENCY_KEY_REUSED.
+      schema: { type: string, maxLength: 200 }
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: Semantic validation failure
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BookNotFound:
+      description: Book not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    SessionNotFound:
+      description: Session not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: SEQ_CONFLICT }
+            message: { type: string }
+            details:
+              type: object
+              additionalProperties: true
+
+    Book:
+      type: object
+      required: [id, title, author, format, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        isbn: { type: string, nullable: true }
+        title: { type: string }
+        author: { type: string }
+        publisher: { type: string, nullable: true }
+        publishedYear: { type: integer, nullable: true }
+        totalPages: { type: integer, nullable: true }
+        format:
+          type: string
+          enum: [PAPERBACK, HARDCOVER, EBOOK, AUDIOBOOK, OTHER]
+        createdAt: { type: string, format: date-time }
+
+    CreateBookRequest:
+      type: object
+      required: [title, author]
+      properties:
+        isbn: { type: string }
+        title: { type: string }
+        author: { type: string }
+        publisher: { type: string }
+        publishedYear: { type: integer }
+        totalPages: { type: integer }
+        format:
+          type: string
+          enum: [PAPERBACK, HARDCOVER, EBOOK, AUDIOBOOK, OTHER]
+          default: PAPERBACK
+
+    Session:
+      type: object
+      required: [id, bookId, status, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        bookId: { type: string, format: uuid }
+        label: { type: string, nullable: true }
+        status:
+          type: string
+          enum: [pending, active, ended]
+        createdAt: { type: string, format: date-time }
+
+    CreateSessionRequest:
+      type: object
+      required: [bookId]
+      properties:
+        bookId: { type: string, format: uuid }
+        label: { type: string }
+
+    EventType:
+      type: string
+      enum:
+        - SESSION_STARTED
+        - PAGE_REACHED
+        - PASSAGE_REACTED
+        - INTERRUPTED
+        - SESSION_ENDED
+
+    Event:
+      type: object
+      required: [id, sessionId, seq, eventType, occurredAt, recordedAt]
+      properties:
+        id: { type: string, format: uuid }
+        sessionId: { type: string, format: uuid }
+        seq: { type: integer, minimum: 1 }
+        eventType: { $ref: "#/components/schemas/EventType" }
+        occurredAt:
+          { type: string, format: date-time, description: UTC RFC3339Nano }
+        page: { type: integer, nullable: true }
+        note: { type: string, nullable: true }
+        quote: { type: string, nullable: true }
+        reason: { type: string, nullable: true }
+        recordedAt:
+          {
+            type: string,
+            format: date-time,
+            description: Server receive time (UTC),
+          }
+
+    AppendEventRequest:
+      type: object
+      required: [eventType, occurredAt, expectedSeq]
+      properties:
+        eventType: { $ref: "#/components/schemas/EventType" }
+        occurredAt: { type: string, format: date-time }
+        page: { type: integer }
+        note: { type: string }
+        quote: { type: string }
+        reason: { type: string }
+        expectedSeq:
+          type: integer
+          minimum: 0
+          description: The sequence the client expects to append after.
+
+    Passage:
+      type: object
+      required: [seq, note, occurredAt]
+      properties:
+        seq: { type: integer }
+        page: { type: integer, nullable: true }
+        note: { type: string }
+        quote: { type: string, nullable: true }
+        occurredAt: { type: string, format: date-time }
+
+    SessionDetail:
+      allOf:
+        - $ref: "#/components/schemas/Session"
+        - type: object
+          required:
+            [
+              book,
+              readingDurationSeconds,
+              readingMinutes,
+              interruptionCount,
+              passages,
+              eventCount,
+              events,
+            ]
+          properties:
+            book: { $ref: "#/components/schemas/Book" }
+            startedAt: { type: string, format: date-time, nullable: true }
+            endedAt: { type: string, format: date-time, nullable: true }
+            readingDurationSeconds: { type: integer }
+            readingMinutes: { type: number, format: float }
+            lastPage: { type: integer, nullable: true }
+            interruptionCount: { type: integer }
+            passages:
+              type: array
+              items: { $ref: "#/components/schemas/Passage" }
+            eventCount: { type: integer }
+            events:
+              type: array
+              items: { $ref: "#/components/schemas/Event" }
