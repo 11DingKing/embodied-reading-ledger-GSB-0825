@@ -1,0 +1,313 @@
+openapi: 3.1.0
+info:
+  title: Embodied Reading Event Ledger API
+  version: 1.0.0
+  description: >
+    具身阅读事件账本。登记实体书版本、创建阅读会话，并按顺序追加
+    SESSION_STARTED / PAGE_REACHED / PASSAGE_REACTED / INTERRUPTED / SESSION_ENDED
+    事件。服务端据此还原阅读分钟数、最后页码、打断次数与读者亲手写下的感受。
+    所有写接口接受 Idempotency-Key；追加事件必须携带 expectedSeq。
+    时间一律使用 UTC RFC3339Nano。
+servers:
+  - url: http://localhost:8080
+
+paths:
+  /healthz:
+    get:
+      summary: 健康检查
+      responses:
+        "200":
+          description: 服务存活
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /books:
+    post:
+      summary: 登记一本实体书版本
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateBookRequest" }
+      responses:
+        "201":
+          description: 已登记
+          headers:
+            Idempotent-Replay:
+              schema: { type: string, enum: ["true"] }
+              description: 仅当本次响应来自幂等重放时出现
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Book" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+
+  /sessions:
+    post:
+      summary: 为一本书创建阅读会话
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSessionRequest" }
+      responses:
+        "201":
+          description: 会话已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/BookNotFound" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+
+  /sessions/{sessionId}/events:
+    post:
+      summary: 追加一个阅读事件（仅追加，序号由服务端分配）
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AppendEventRequest" }
+      responses:
+        "201":
+          description: 事件已追加
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventAck" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/SessionNotFound" }
+        "409":
+          description: >
+            expectedSeq 与服务端当前序号不一致（SEQUENCE_CONFLICT，details 带 currentSeq）；
+            或幂等键冲突/进行中（IDEMPOTENCY_KEY_REUSED / IDEMPOTENCY_IN_FLIGHT）。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: >
+            非法状态迁移：SESSION_NOT_STARTED / SESSION_ALREADY_STARTED /
+            SESSION_ALREADY_ENDED / CLOCK_WENT_BACKWARDS / PAGE_OUT_OF_RANGE /
+            INVALID_EVENT_PAYLOAD。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /sessions/{sessionId}:
+    get:
+      summary: 读取会话账本与服务端还原结果
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 会话详情
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionDetail" }
+        "404": { $ref: "#/components/responses/SessionNotFound" }
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: 客户端生成的幂等键；相同键 + 相同请求体重放将返回首次响应且不二次落库
+      schema: { type: string, maxLength: 200 }
+
+  responses:
+    ValidationError:
+      description: 请求体/参数不合法（VALIDATION_ERROR、INVALID_TIMESTAMP）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    IdempotencyConflict:
+      description: 幂等键被不同请求体重用，或同键请求仍在进行中
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BookNotFound:
+      description: 引用的书不存在（BOOK_NOT_FOUND）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    SessionNotFound:
+      description: 会话不存在（SESSION_NOT_FOUND）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - VALIDATION_ERROR
+                - INVALID_TIMESTAMP
+                - BOOK_NOT_FOUND
+                - SESSION_NOT_FOUND
+                - SEQUENCE_CONFLICT
+                - IDEMPOTENCY_KEY_REUSED
+                - IDEMPOTENCY_IN_FLIGHT
+                - SESSION_NOT_STARTED
+                - SESSION_ALREADY_STARTED
+                - SESSION_ALREADY_ENDED
+                - CLOCK_WENT_BACKWARDS
+                - PAGE_OUT_OF_RANGE
+                - INVALID_EVENT_PAYLOAD
+                - INTERNAL
+            message: { type: string }
+            details: { type: object, additionalProperties: true }
+      example:
+        error:
+          code: SEQUENCE_CONFLICT
+          message: "expected seq 1 but session is at seq 2"
+          details: { expectedSeq: 1, currentSeq: 2 }
+
+    CreateBookRequest:
+      type: object
+      required: [isbn, title, author, totalPages]
+      additionalProperties: false
+      properties:
+        isbn: { type: string, minLength: 1 }
+        title: { type: string, minLength: 1 }
+        author: { type: string, minLength: 1 }
+        edition: { type: string, default: "" }
+        totalPages: { type: integer, minimum: 1 }
+
+    Book:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        isbn: { type: string }
+        title: { type: string }
+        author: { type: string }
+        edition: { type: string }
+        totalPages: { type: integer }
+        createdAt: { type: string, format: date-time, description: "UTC RFC3339Nano" }
+
+    CreateSessionRequest:
+      type: object
+      required: [bookId, readerTag]
+      additionalProperties: false
+      properties:
+        bookId: { type: string, format: uuid }
+        readerTag: { type: string, minLength: 1 }
+
+    Session:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        bookId: { type: string, format: uuid }
+        readerTag: { type: string }
+        status: { type: string, enum: [open, ended] }
+        createdAt: { type: string, format: date-time }
+
+    AppendEventRequest:
+      type: object
+      required: [expectedSeq, event]
+      additionalProperties: false
+      properties:
+        expectedSeq:
+          type: integer
+          minimum: 0
+          description: 客户端认知的当前最大序号；首个事件为 0
+        event:
+          type: object
+          required: [type, occurredAt]
+          additionalProperties: false
+          properties:
+            type:
+              type: string
+              enum:
+                - SESSION_STARTED
+                - PAGE_REACHED
+                - PASSAGE_REACTED
+                - INTERRUPTED
+                - SESSION_ENDED
+            occurredAt:
+              type: string
+              format: date-time
+              description: "UTC RFC3339Nano，必须严格晚于上一事件"
+            payload:
+              type: object
+              description: >
+                SESSION_STARTED/SESSION_ENDED: {}；
+                PAGE_REACHED: {"page": int}（1..totalPages）；
+                PASSAGE_REACTED: {"page"?: int, "quote"?: string, "note": string}（note 必填）；
+                INTERRUPTED: {"reason"?: string}。
+
+    EventAck:
+      type: object
+      properties:
+        sessionId: { type: string, format: uuid }
+        seq: { type: integer, description: 服务端分配的新序号 }
+        eventType: { type: string }
+        occurredAt: { type: string, format: date-time }
+        recordedAt: { type: string, format: date-time }
+
+    SessionDetail:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        bookId: { type: string, format: uuid }
+        readerTag: { type: string }
+        status: { type: string, enum: [open, ended] }
+        createdAt: { type: string, format: date-time }
+        book:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            title: { type: string }
+            author: { type: string }
+            totalPages: { type: integer }
+        startedAt: { type: [string, "null"], format: date-time }
+        endedAt: { type: [string, "null"], format: date-time }
+        lastPage: { type: [integer, "null"] }
+        maxPage: { type: integer }
+        interruptionCount: { type: integer }
+        readingMinutes:
+          type: number
+          description: 相邻事件间隔之和；INTERRUPTED 之后到下一事件的间隔视为中断，不计入
+        reactions:
+          type: array
+          items:
+            type: object
+            properties:
+              seq: { type: integer }
+              occurredAt: { type: string, format: date-time }
+              page: { type: integer }
+              quote: { type: string }
+              note: { type: string }
+        events:
+          type: array
+          items:
+            type: object
+            properties:
+              seq: { type: integer }
+              type: { type: string }
+              occurredAt: { type: string, format: date-time }
+              payload: { type: object }
